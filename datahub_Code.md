@@ -34,10 +34,13 @@ The content is organized as follows:
 
 # Directory Structure
 ```
+.gitignore
 Dockerfile
 ecosystem.config.cjs
 package.json
 scripts/call_sessions_api.sh
+scripts/call_vlan_sync_api.sh
+scripts/setup-vlan-sync.sql
 src/app.js
 src/asp/aspSessions.paged.service.js
 src/asp/aspSessions.service.js
@@ -45,17 +48,34 @@ src/ASPHelper/Apis.js
 src/config.js
 src/db/pgPool.js
 src/db/session.repository.js
+src/db/vlanSync.repository.js
 src/logger.js
 src/routes/sessions.route.js
+src/routes/vlanSync.route.js
 src/server.js
 src/services/session.service.js
 src/services/sessionRangePaged.service.js
+src/services/vlanSync.service.js
+src/SQHelper/aspVlanSync.helper.js
 src/utils/sessionMerger.js
 src/utils/sessionNormalizer.js
 src/utils/utils.js
+src/utils/vlanSync.mapper.js
+src/utils/vlanSync.schemaDrift.js
 ```
 
 # Files
+
+## File: scripts/call_vlan_sync_api.sh
+```bash
+#!/bin/bash
+
+URL="http://localhost:3010/api/vlan-sync"
+LOG_FILE="/var/log/datahub_api/curl_vlan_sync.log"
+
+curl -s -X POST "$URL" >> "$LOG_FILE" 2>&1
+echo "---- $(date '+%Y-%m-%d %H:%M:%S') ----" >> "$LOG_FILE"
+```
 
 ## File: Dockerfile
 ```dockerfile
@@ -164,6 +184,62 @@ crontab -e
 */10 * * * * /data/scripts/call_sessions_api.sh
 ```
 
+## File: scripts/setup-vlan-sync.sql
+```sql
+---POSTGRESQL SETUP SCRIPT FOR VLAN SESSION SYNC TABLE
+DROP TABLE IF EXISTS vlan_session_sync;
+
+CREATE TABLE vlan_session_sync (
+    id BIGSERIAL PRIMARY KEY,
+
+    site_token TEXT,
+
+    session_id TEXT NOT NULL,
+    local_id TEXT,
+    nas_ip_address TEXT,
+
+    vlan TEXT,
+
+    duration INTEGER,
+    download_bytes BIGINT,
+    upload_bytes BIGINT,
+
+    mac_address TEXT,
+    ip_address TEXT,
+
+    device TEXT,
+    browser TEXT,
+    os TEXT,
+
+    terminate_cause TEXT,
+
+    session_start TIMESTAMPTZ NOT NULL,
+    session_stop TIMESTAMPTZ,
+    session_updated TIMESTAMPTZ,
+
+    raw_payload JSONB,
+
+    synced_at TIMESTAMPTZ DEFAULT NOW(),
+
+    CONSTRAINT uq_vlan_session_sync UNIQUE (session_id, session_start)
+);
+
+CREATE INDEX idx_vlan_session_sync_session_updated
+ON vlan_session_sync(session_updated);
+
+CREATE INDEX idx_vlan_session_sync_session_start
+ON vlan_session_sync(session_start);
+
+CREATE INDEX idx_vlan_session_sync_session_stop
+ON vlan_session_sync(session_stop);
+
+CREATE INDEX idx_vlan_session_sync_vlan
+ON vlan_session_sync(vlan);
+
+CREATE INDEX idx_vlan_session_sync_synced_at
+ON vlan_session_sync(synced_at);
+```
+
 ## File: src/app.js
 ```javascript
 import express from "express"
@@ -172,6 +248,7 @@ import helmet from "helmet";
 import logger from "./logger.js";
 import sessionRoutes from "./routes/sessions.route.js"
 import { cfg } from "./config.js";
+import vlanSyncRoutes from "./routes/vlanSync.route.js";
 
 const app = express()
 
@@ -232,6 +309,7 @@ app.use((req, res, next) => {
 
 
 app.use("/api/sessions", sessionRoutes)
+app.use("/api/vlan-sync", vlanSyncRoutes);
 
 // 404 handler
 app.use((req, res) => {
@@ -612,6 +690,30 @@ const schema = z.object({
   LOG_LEVEL: z.string().default("info"),
   LOG_PATH: z.string().default(path.join(process.cwd(), "logs")),
   IS_PROD: z.boolean().default(false),
+
+  /**
+   * ASP sync settings
+   */
+  ASP_SYNC_MODE: z.enum(["updated", "start_stop"]).default("start_stop"),
+
+  ASP_SYNC_BATCH_SIZE: z.coerce.number().default(5000),
+  ASP_SYNC_PAGE_LIMIT: z.coerce.number().default(5000),
+  ASP_SYNC_MAX_PAGES: z.coerce.number().default(2000),
+  ASP_SYNC_PAGE_DELAY_MS: z.coerce.number().default(200),
+
+  /**
+   * Used only when target table is empty.
+   */
+  ASP_SYNC_START_DATE: z.string().default("2024-01-01 00:00:00"),
+
+  /**
+   * Small overlap protects against boundary issues.
+   * Example:
+   * Last sync = 10:00:00
+   * Next sync starts from 09:55:00
+   * Duplicates are safely ignored/upserted.
+   */
+  ASP_SYNC_OVERLAP_MINUTES: z.coerce.number().default(5),
 });
 
 const env = {
@@ -724,6 +826,256 @@ export async function upsertSessions(client, sessions) {
   if (!sessions?.length) return 0;
   await client.query(UPSERT_SQL, [JSON.stringify(sessions)]);
   return sessions.length;
+}
+```
+
+## File: src/db/vlanSync.repository.js
+```javascript
+import pool from "./pgPool.js";
+import logger from "../logger.js";
+import { cfg } from "../config.js";
+
+export async function testPGConnection() {
+  await pool.query("SELECT 1 AS ok");
+  logger.info("PostgreSQL connection healthy");
+  return true;
+}
+
+export async function checkTargetTableSchema() {
+  const result = await pool.query(
+    `
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_name = 'vlan_session_sync'
+    `
+  );
+
+  const actual = new Set(result.rows.map((row) => row.column_name));
+
+  const required = [
+    "session_id",
+    "session_start",
+    "session_updated",
+    "vlan",
+    "synced_at",
+  ];
+
+  const missing = required.filter((column) => !actual.has(column));
+
+  if (missing.length > 0) {
+    throw new Error(
+      `PostgreSQL schema check failed. Missing columns in vlan_session_sync: ${missing.join(
+        ", "
+      )}`
+    );
+  }
+
+  logger.info("PostgreSQL schema check passed", {
+    table: "vlan_session_sync",
+  });
+}
+
+function subtractOverlap(date, overlapMinutes) {
+  const d = new Date(date);
+  d.setUTCMinutes(d.getUTCMinutes() - overlapMinutes);
+  return d;
+}
+
+function formatForASP(date) {
+  const d = new Date(date);
+
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mi = String(d.getUTCMinutes()).padStart(2, "0");
+  const ss = String(d.getUTCSeconds()).padStart(2, "0");
+
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
+}
+
+/**
+ * High-water mark.
+ *
+ * In updated mode:
+ *   Uses max(session_updated)
+ *
+ * In start_stop mode:
+ *   Uses max(synced_at) as operational progress marker,
+ *   then applies overlap to avoid missed sessions.
+ */
+export async function getHighWaterMark() {
+  const column =
+    cfg.ASP_SYNC_MODE === "updated" ? "session_updated" : "synced_at";
+
+  const result = await pool.query(`
+    SELECT MAX(${column}) AS last_sync
+    FROM vlan_session_sync
+  `);
+
+  const lastSync = result.rows[0]?.last_sync;
+
+  const rawFrom = lastSync || cfg.ASP_SYNC_START_DATE;
+
+  const fromWithOverlap = subtractOverlap(
+    rawFrom,
+    cfg.ASP_SYNC_OVERLAP_MINUTES
+  );
+
+  const from = formatForASP(fromWithOverlap);
+  const to = formatForASP(new Date());
+
+  logger.info("High-water mark determined", {
+    syncMode: cfg.ASP_SYNC_MODE,
+    column,
+    lastSync,
+    from,
+    to,
+    overlapMinutes: cfg.ASP_SYNC_OVERLAP_MINUTES,
+  });
+
+  return {
+    lastSync,
+    from,
+    to,
+  };
+}
+
+export async function upsertVlanSessionBatch(client, batch) {
+  if (!batch.length) return 0;
+
+  const columnsPerRow = 18;
+  const values = [];
+  const placeholders = [];
+
+  batch.forEach((row, index) => {
+    const offset = index * columnsPerRow;
+
+    placeholders.push(`
+      (
+        $${offset + 1},
+        $${offset + 2},
+        $${offset + 3},
+        $${offset + 4},
+        $${offset + 5},
+        $${offset + 6},
+        NULLIF($${offset + 7}, '')::BIGINT,
+        NULLIF($${offset + 8}, '')::BIGINT,
+        $${offset + 9},
+        $${offset + 10},
+        $${offset + 11},
+        $${offset + 12},
+        $${offset + 13},
+        $${offset + 14},
+        $${offset + 15},
+        $${offset + 16},
+        $${offset + 17},
+        $${offset + 18}::jsonb
+      )
+    `);
+
+    values.push(
+      row.site_token ?? null,
+      row.session_id,
+      row.local_id ?? null,
+      row.nas_ip_address ?? null,
+
+      row.vlan ?? null,
+
+      row.duration ?? null,
+      row.download_bytes ?? null,
+      row.upload_bytes ?? null,
+
+      row.mac_address ?? null,
+      row.ip_address ?? null,
+
+      row.device ?? null,
+      row.browser ?? null,
+      row.os ?? null,
+
+      row.terminate_cause ?? null,
+
+      row.session_start,
+      row.session_stop,
+      row.session_updated,
+
+      JSON.stringify(row.raw_payload ?? {})
+    );
+  });
+
+  const sql = `
+    INSERT INTO vlan_session_sync (
+      site_token,
+      session_id,
+      local_id,
+      nas_ip_address,
+      vlan,
+      duration,
+      download_bytes,
+      upload_bytes,
+      mac_address,
+      ip_address,
+      device,
+      browser,
+      os,
+      terminate_cause,
+      session_start,
+      session_stop,
+      session_updated,
+      raw_payload
+    )
+    VALUES ${placeholders.join(",")}
+    ON CONFLICT (session_id, session_start)
+    DO UPDATE SET
+      site_token       = EXCLUDED.site_token,
+      local_id         = EXCLUDED.local_id,
+      nas_ip_address   = EXCLUDED.nas_ip_address,
+      vlan             = EXCLUDED.vlan,
+      duration         = EXCLUDED.duration,
+      download_bytes   = EXCLUDED.download_bytes,
+      upload_bytes     = EXCLUDED.upload_bytes,
+      mac_address      = EXCLUDED.mac_address,
+      ip_address       = EXCLUDED.ip_address,
+      device           = EXCLUDED.device,
+      browser          = EXCLUDED.browser,
+      os               = EXCLUDED.os,
+      terminate_cause  = EXCLUDED.terminate_cause,
+      session_stop     = EXCLUDED.session_stop,
+      session_updated  = EXCLUDED.session_updated,
+      raw_payload      = EXCLUDED.raw_payload,
+      synced_at        = NOW()
+  `;
+
+  const result = await client.query(sql, values);
+
+  return result.rowCount || 0;
+}
+
+export async function insertBatchInTransaction(batch, batchNumber) {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const affected = await upsertVlanSessionBatch(client, batch);
+
+    await client.query("COMMIT");
+
+    return affected;
+  } catch (error) {
+    await client.query("ROLLBACK");
+
+    logger.error("Batch insert failed", {
+      batchNumber,
+      batchSize: batch.length,
+      error: error.message,
+      stack: error.stack,
+    });
+
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 ```
 
@@ -886,6 +1238,40 @@ router.post("/range", async (req, res) => {
   } catch (err) {
     logger.error("Custom range pull failed", { error: err.message, stack: err.stack });
     res.status(500).json({ status: "error", message: err.message });
+  }
+});
+
+export default router;
+```
+
+## File: src/routes/vlanSync.route.js
+```javascript
+import express from "express";
+import logger from "../logger.js";
+import { runVlanIncrementalSync } from "../services/vlanSync.service.js";
+
+const router = express.Router();
+
+/**
+ * POST /api/vlan-sync
+ *
+ * Runs incremental ASP -> PostgreSQL sync.
+ */
+router.post("/", async (req, res) => {
+  try {
+    const result = await runVlanIncrementalSync();
+
+    res.json(result);
+  } catch (error) {
+    logger.error("VLAN sync route failed", {
+      error: error.message,
+      stack: error.stack,
+    });
+
+    res.status(500).json({
+      status: "error",
+      message: error.message,
+    });
   }
 });
 
@@ -1121,6 +1507,432 @@ export async function pullAndStoreSessionsRangePaged({
 }
 ```
 
+## File: src/services/vlanSync.service.js
+```javascript
+import logger from "../logger.js";
+import { cfg } from "../config.js";
+
+import {
+  testASPConnection,
+  processASPWindowByPages,
+} from "../SQHelper/aspVlanSync.helper.js";
+
+import {
+  testPGConnection,
+  checkTargetTableSchema,
+  getHighWaterMark,
+  insertBatchInTransaction,
+} from "../db/vlanSync.repository.js";
+
+import { normalizeASPSessions } from "../utils/vlanSync.mapper.js";
+import { checkASPSchemaDrift } from "../utils/vlanSync.schemaDrift.js";
+
+function chunkArray(items, size) {
+  const chunks = [];
+
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+
+  return chunks;
+}
+
+function uniqueBySessionKey(rows) {
+  const map = new Map();
+
+  for (const row of rows) {
+    const key = `${row.session_id}::${new Date(row.session_start).toISOString()}`;
+
+    map.set(key, row);
+  }
+
+  return Array.from(map.values());
+}
+
+async function processRowsPage({
+  rows,
+  type,
+  page,
+  metrics,
+}) {
+  if (!rows.length) return;
+
+  if (!metrics.schemaChecked) {
+    checkASPSchemaDrift(rows[0]);
+    metrics.schemaChecked = true;
+  }
+
+  metrics.fetched += rows.length;
+
+  const { normalized, skipped } = normalizeASPSessions(rows);
+
+  metrics.skippedInvalid += skipped;
+
+  const uniqueRows = uniqueBySessionKey(normalized);
+
+  metrics.duplicatesInsidePage += normalized.length - uniqueRows.length;
+
+  const batches = chunkArray(uniqueRows, cfg.ASP_SYNC_BATCH_SIZE);
+
+  for (const batch of batches) {
+    metrics.batchNumber += 1;
+
+    const affected = await insertBatchInTransaction(
+      batch,
+      metrics.batchNumber
+    );
+
+    metrics.insertedOrUpdated += affected;
+
+    if (metrics.batchNumber === 1 || metrics.batchNumber % 5 === 0) {
+      logger.info("ASP sync batch completed", {
+        type,
+        page,
+        batchNumber: metrics.batchNumber,
+        batchSize: batch.length,
+        affected,
+        fetched: metrics.fetched,
+        insertedOrUpdated: metrics.insertedOrUpdated,
+      });
+    }
+  }
+}
+
+/**
+ * Production sync.
+ *
+ * Key behavior:
+ * - tests ASP and PG connections first
+ * - checks PG schema
+ * - determines high-water mark
+ * - fetches ASP page-by-page
+ * - never stores all pages in memory
+ * - inserts using batch transactions
+ * - uses ON CONFLICT for idempotency
+ * - logs clear success/failure metrics
+ */
+export async function runVlanIncrementalSync() {
+  const startedAt = Date.now();
+
+  const metrics = {
+    fetched: 0,
+    insertedOrUpdated: 0,
+    skippedInvalid: 0,
+    duplicatesInsidePage: 0,
+    batchNumber: 0,
+    schemaChecked: false,
+    windowsProcessed: [],
+  };
+
+  try {
+    logger.info("Starting ASP VLAN incremental sync", {
+      syncMode: cfg.ASP_SYNC_MODE,
+      batchSize: cfg.ASP_SYNC_BATCH_SIZE,
+      pageLimit: cfg.ASP_SYNC_PAGE_LIMIT,
+      pageDelayMs: cfg.ASP_SYNC_PAGE_DELAY_MS,
+      maxPages: cfg.ASP_SYNC_MAX_PAGES,
+    });
+
+    await testASPConnection();
+    await testPGConnection();
+    await checkTargetTableSchema();
+
+    const { from, to, lastSync } = await getHighWaterMark();
+
+    if (cfg.ASP_SYNC_MODE === "updated") {
+      const summary = await processASPWindowByPages({
+        from,
+        to,
+        type: "updated",
+        onPage: async ({ rows, page, type }) => {
+          await processRowsPage({
+            rows,
+            type,
+            page,
+            metrics,
+          });
+        },
+      });
+
+      metrics.windowsProcessed.push(summary);
+    } else {
+      /**
+       * Fallback mode:
+       * Fetch sessions created in window and sessions stopped in window.
+       *
+       * This is compatible with your current ASP code, which already uses
+       * sessionStartDateTimeStart/End and sessionStopDateTimeStart/End.
+       */
+      const startSummary = await processASPWindowByPages({
+        from,
+        to,
+        type: "start",
+        onPage: async ({ rows, page, type }) => {
+          await processRowsPage({
+            rows,
+            type,
+            page,
+            metrics,
+          });
+        },
+      });
+
+      const stopSummary = await processASPWindowByPages({
+        from,
+        to,
+        type: "stop",
+        onPage: async ({ rows, page, type }) => {
+          await processRowsPage({
+            rows,
+            type,
+            page,
+            metrics,
+          });
+        },
+      });
+
+      metrics.windowsProcessed.push(startSummary, stopSummary);
+    }
+
+    const durationSeconds = Number(((Date.now() - startedAt) / 1000).toFixed(2));
+
+    const result = {
+      status: "success",
+      syncMode: cfg.ASP_SYNC_MODE,
+      lastSync,
+      from,
+      to,
+      fetched: metrics.fetched,
+      insertedOrUpdated: metrics.insertedOrUpdated,
+      skippedInvalid: metrics.skippedInvalid,
+      duplicatesInsidePage: metrics.duplicatesInsidePage,
+      batchesProcessed: metrics.batchNumber,
+      windowsProcessed: metrics.windowsProcessed,
+      durationSeconds,
+    };
+
+    logger.info("ASP VLAN SYNC COMPLETED SUCCESSFULLY", result);
+
+    return result;
+  } catch (error) {
+    const durationSeconds = Number(((Date.now() - startedAt) / 1000).toFixed(2));
+
+    logger.error("ASP VLAN SYNC FAILED", {
+      error: error.message,
+      stack: error.stack,
+      fetched: metrics.fetched,
+      insertedOrUpdated: metrics.insertedOrUpdated,
+      skippedInvalid: metrics.skippedInvalid,
+      duplicatesInsidePage: metrics.duplicatesInsidePage,
+      batchesProcessed: metrics.batchNumber,
+      durationSeconds,
+      note: "Next run will resume using high-water mark plus overlap. Already committed batches remain safe.",
+    });
+
+    throw error;
+  }
+}
+```
+
+## File: src/SQHelper/aspVlanSync.helper.js
+```javascript
+import logger from "../logger.js";
+import { cfg } from "../config.js";
+import { getToken, getSessions } from "../ASPHelper/Apis.js";
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function testASPConnection() {
+  const token = await getToken();
+
+  if (!token) {
+    throw new Error("ASP connection failed: token was not returned");
+  }
+
+  logger.info("ASP connection healthy");
+
+  return true;
+}
+
+export function getSessionsFromResponse(resp) {
+  return resp?.data?.session ?? [];
+}
+
+export function getTotalCountFromResponse(resp) {
+  const count = Number(resp?.count);
+  return Number.isFinite(count) ? count : null;
+}
+
+/**
+ * This supports two modes:
+ *
+ * 1. updated:
+ *    Best production mode if ASP supports:
+ *    sessionUpdatedDateTimeStart / sessionUpdatedDateTimeEnd
+ *
+ * 2. start_stop:
+ *    Compatible with your existing code.
+ *    Fetches sessions by start window and stop window.
+ */
+export async function fetchASPPage({
+  from,
+  to,
+  page,
+  limit,
+  type = "updated",
+  scope = "all",
+}) {
+  let params;
+
+  if (type === "updated") {
+    params = {
+      page,
+      limit,
+      sessionUpdatedDateTimeStart: from,
+      sessionUpdatedDateTimeEnd: to,
+    };
+  } else if (type === "start") {
+    params = {
+      page,
+      limit,
+      sessionStartDateTimeStart: from,
+      sessionStartDateTimeEnd: to,
+    };
+  } else if (type === "stop") {
+    params = {
+      page,
+      limit,
+      sessionStopDateTimeStart: from,
+      sessionStopDateTimeEnd: to,
+    };
+  } else {
+    throw new Error(`Unsupported ASP fetch type: ${type}`);
+  }
+
+  const resp = await getSessions(params, scope);
+
+  if (!resp) {
+    throw new Error(`ASP returned empty response for type=${type}, page=${page}`);
+  }
+
+  return resp;
+}
+
+/**
+ * Page-by-page processor.
+ *
+ * Important:
+ * This DOES NOT collect all records into memory.
+ * It fetches one page, sends it to caller, then forgets it.
+ *
+ * This is the ASP equivalent of MySQL streaming from sync-vlan-sms.js.
+ */
+export async function processASPWindowByPages({
+  from,
+  to,
+  type,
+  scope = "all",
+  pageLimit = cfg.ASP_SYNC_PAGE_LIMIT,
+  maxPages = cfg.ASP_SYNC_MAX_PAGES,
+  pageDelayMs = cfg.ASP_SYNC_PAGE_DELAY_MS,
+  onPage,
+}) {
+  let page = 0;
+  let totalFetched = 0;
+  let totalCount = null;
+  let totalPages = null;
+
+  while (true) {
+    if (page > maxPages) {
+      throw new Error(
+        `ASP pagination safety limit reached. type=${type}, page=${page}, maxPages=${maxPages}`
+      );
+    }
+
+    const resp = await fetchASPPage({
+      from,
+      to,
+      page,
+      limit: pageLimit,
+      type,
+      scope,
+    });
+
+    const rows = getSessionsFromResponse(resp);
+
+    if (totalCount === null) {
+      totalCount = getTotalCountFromResponse(resp);
+
+      if (totalCount !== null) {
+        totalPages = Math.ceil(totalCount / pageLimit);
+
+        logger.info("ASP pagination plan", {
+          type,
+          totalCount,
+          totalPages,
+          pageLimit,
+          from,
+          to,
+        });
+
+        if (totalCount === 0) {
+          break;
+        }
+      } else {
+        logger.warn("ASP response missing numeric count; using fallback stop logic", {
+          type,
+          page,
+          count: resp?.count,
+        });
+      }
+    }
+
+    if (!rows.length) {
+      logger.info("ASP pagination stopped: empty page", {
+        type,
+        page,
+        totalFetched,
+      });
+      break;
+    }
+
+    totalFetched += rows.length;
+
+    await onPage({
+      rows,
+      page,
+      type,
+      totalFetched,
+      totalCount,
+      totalPages,
+    });
+
+    if (totalPages !== null) {
+      if (page >= totalPages - 1) {
+        break;
+      }
+    } else if (rows.length < pageLimit) {
+      break;
+    }
+
+    page += 1;
+
+    if (pageDelayMs > 0) {
+      await sleep(pageDelayMs);
+    }
+  }
+
+  return {
+    type,
+    totalFetched,
+    totalCount,
+    totalPages,
+  };
+}
+```
+
 ## File: src/utils/sessionMerger.js
 ```javascript
 import { normalizeSession } from "./sessionNormalizer.js";
@@ -1216,4 +2028,225 @@ function getWindow10MinBack1Day(nowUtc = moment.utc()) {
 }
 
 export {getWindow10MinBack1Day};
+```
+
+## File: src/utils/vlanSync.mapper.js
+```javascript
+function firstDefined(...values) {
+  return values.find((value) => value !== undefined && value !== null);
+}
+
+function toIntegerOrNull(value) {
+  if (value === undefined || value === null || value === "") return null;
+
+  const num = Number(value);
+
+  return Number.isFinite(num) ? Math.trunc(num) : null;
+}
+
+function toBigIntTextOrNull(value) {
+  if (value === undefined || value === null || value === "") return null;
+
+  return String(value);
+}
+
+function toDateOrNull(value) {
+  if (!value) return null;
+
+  const date = new Date(value);
+
+  if (Number.isNaN(date.getTime())) return null;
+
+  return date;
+}
+
+export function normalizeASPSession(row) {
+  const sessionId = firstDefined(
+    row.session_id,
+    row.sessionId,
+    row.id,
+    row.sessionID
+  );
+
+  const sessionStart = firstDefined(
+    row.session_start,
+    row.sessionStart,
+    row.sessionStartDateTime,
+    row.startTime
+  );
+
+  const sessionStop = firstDefined(
+    row.session_stop,
+    row.sessionStop,
+    row.sessionStopDateTime,
+    row.stopTime
+  );
+
+  const sessionUpdated = firstDefined(
+    row.session_updated,
+    row.sessionUpdated,
+    row.sessionUpdatedDateTime,
+    row.updatedAt,
+    row.updateTime,
+    sessionStop,
+    sessionStart
+  );
+
+  if (!sessionId || !sessionStart) {
+    return null;
+  }
+
+  return {
+    site_token: firstDefined(row.site_token, row.siteToken, row.site),
+    session_id: String(sessionId),
+    local_id: firstDefined(row.local_id, row.localId),
+    nas_ip_address: firstDefined(row.nas_ip_address, row.nasIpAddress),
+
+    vlan: firstDefined(row.vlan, row.vlan_id, row.vlanId),
+
+    duration: toIntegerOrNull(firstDefined(row.duration, row.sessionDuration)),
+
+    download_bytes: toBigIntTextOrNull(
+      firstDefined(row.download_bytes, row.downloadBytes, row.download)
+    ),
+
+    upload_bytes: toBigIntTextOrNull(
+      firstDefined(row.upload_bytes, row.uploadBytes, row.upload)
+    ),
+
+    mac_address: firstDefined(row.mac_address, row.macAddress, row.mac),
+    ip_address: firstDefined(row.ip_address, row.ipAddress, row.ip),
+
+    device: firstDefined(row.device),
+    browser: firstDefined(row.browser),
+    os: firstDefined(row.os),
+
+    terminate_cause: firstDefined(
+      row.terminate_cause,
+      row.terminateCause,
+      row.stopReason
+    ),
+
+    session_start: toDateOrNull(sessionStart),
+    session_stop: toDateOrNull(sessionStop),
+    session_updated: toDateOrNull(sessionUpdated),
+
+    raw_payload: row,
+  };
+}
+
+export function normalizeASPSessions(rows) {
+  const normalized = [];
+  let skipped = 0;
+
+  for (const row of rows) {
+    const item = normalizeASPSession(row);
+
+    if (!item) {
+      skipped += 1;
+      continue;
+    }
+
+    normalized.push(item);
+  }
+
+  return {
+    normalized,
+    skipped,
+  };
+}
+```
+
+## File: src/utils/vlanSync.schemaDrift.js
+```javascript
+import logger from "../logger.js";
+
+const EXPECTED_ASP_FIELDS = new Set([
+  "site_token",
+  "siteToken",
+  "site",
+
+  "session_id",
+  "sessionId",
+  "sessionID",
+  "id",
+
+  "local_id",
+  "localId",
+
+  "nas_ip_address",
+  "nasIpAddress",
+
+  "vlan",
+  "vlan_id",
+  "vlanId",
+
+  "duration",
+  "sessionDuration",
+
+  "download_bytes",
+  "downloadBytes",
+  "download",
+
+  "upload_bytes",
+  "uploadBytes",
+  "upload",
+
+  "mac_address",
+  "macAddress",
+  "mac",
+
+  "ip_address",
+  "ipAddress",
+  "ip",
+
+  "device",
+  "browser",
+  "os",
+
+  "terminate_cause",
+  "terminateCause",
+  "stopReason",
+
+  "session_start",
+  "sessionStart",
+  "sessionStartDateTime",
+  "startTime",
+
+  "session_stop",
+  "sessionStop",
+  "sessionStopDateTime",
+  "stopTime",
+
+  "session_updated",
+  "sessionUpdated",
+  "sessionUpdatedDateTime",
+  "updatedAt",
+  "updateTime",
+]);
+
+export function checkASPSchemaDrift(sampleRow) {
+  if (!sampleRow || typeof sampleRow !== "object") return;
+
+  const receivedFields = Object.keys(sampleRow);
+
+  const newFields = receivedFields.filter(
+    (field) => !EXPECTED_ASP_FIELDS.has(field)
+  );
+
+  if (newFields.length > 0) {
+    logger.warn("ASP SCHEMA DRIFT DETECTED", {
+      newFields,
+      action:
+        "Review whether these fields should be added to vlan_session_sync or mapper.",
+    });
+  } else {
+    logger.info("ASP schema drift check passed");
+  }
+}
+```
+
+## File: .gitignore
+```
+.env*
 ```

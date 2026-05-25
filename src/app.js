@@ -4,6 +4,7 @@ import helmet from "helmet";
 import logger from "./logger.js";
 import sessionRoutes from "./routes/sessions.route.js"
 import { cfg } from "./config.js";
+import vlanSyncRoutes from "./routes/vlanSync.route.js";
 
 const app = express()
 
@@ -64,6 +65,7 @@ app.use((req, res, next) => {
 
 
 app.use("/api/sessions", sessionRoutes)
+app.use("/api/vlan-sync", vlanSyncRoutes);
 
 // 404 handler
 app.use((req, res) => {
