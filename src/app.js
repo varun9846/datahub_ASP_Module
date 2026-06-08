@@ -4,6 +4,7 @@ import helmet from "helmet";
 import logger from "./logger.js";
 import sessionRoutes from "./routes/sessions.route.js"
 import { cfg } from "./config.js";
+import vlanSmsSyncRoutes from "./routes/vlanSmsSync.route.js";
 
 const app = express()
 
@@ -64,6 +65,9 @@ app.use((req, res, next) => {
 
 
 app.use("/api/sessions", sessionRoutes)
+
+// New SQHelper module
+app.use("/api/vlan-sms-sync", vlanSmsSyncRoutes);
 
 // 404 handler
 app.use((req, res) => {

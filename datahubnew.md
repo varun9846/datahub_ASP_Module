@@ -34,6 +34,7 @@ The content is organized as follows:
 
 # Directory Structure
 ```
+.gitignore
 Dockerfile
 ecosystem.config.cjs
 package.json
@@ -56,6 +57,11 @@ src/utils/utils.js
 ```
 
 # Files
+
+## File: .gitignore
+```
+.env
+```
 
 ## File: Dockerfile
 ```dockerfile

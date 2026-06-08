@@ -1,0 +1,20 @@
+{
+    "output": {
+        "style": "markdown",
+        "removeComments": true,
+        "showLineNumbers": true,
+        "topFilesLength": 10
+    },
+    "ignore": {
+        "customPatterns": [
+            "*.test.ts",
+            "docs/**",
+            "node_modules/**",
+            "**/*.png",
+            "**/*.jpg",
+            "**/*.jpeg",
+            "**/*.gif",
+            "**/*.svg"
+        ]
+    }
+}
