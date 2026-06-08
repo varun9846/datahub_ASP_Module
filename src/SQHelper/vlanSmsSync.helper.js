@@ -20,76 +20,108 @@ export function formatDateForMySQL(value) {
   return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}.${ms}`;
 }
 
-export function buildVlanSmsSyncQuery() {
-  return `
-    SELECT
-      v.ID AS id,
-      v.vlan_id,
-      s.phone_number,
-      s.message,
-      s.createdAt,
-      s.updatedAt
-    FROM vlan v
-    JOIN sent_SMS s ON v.message_id = s.ID
-    WHERE s.createdAt > ?
-    ORDER BY s.createdAt ASC, v.ID ASC
-  `;
+export async function getVlanSmsRecordCount({
+  mysqlConn,
+  lastSyncForMySQL,
+}) {
+  return new Promise((resolve, reject) => {
+    const countQuery = `
+      SELECT COUNT(*) AS total_records
+      FROM vlan v
+      JOIN sent_SMS s ON v.message_id = s.ID
+      WHERE s.createdAt > ?
+    `;
+
+    mysqlConn.query(countQuery, [lastSyncForMySQL], (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows[0]?.total_records || 0);
+    });
+  });
 }
 
-export async function streamSQVlanSmsRows({
+export async function fetchVlanSmsBatch({
+  mysqlConn,
+  lastSyncForMySQL,
+  offset,
+  limit,
+}) {
+  return new Promise((resolve, reject) => {
+    const query = `
+      SELECT
+        v.ID AS id,
+        v.vlan_id,
+        s.phone_number,
+        s.message,
+        s.createdAt,
+        s.updatedAt
+      FROM vlan v
+      JOIN sent_SMS s ON v.message_id = s.ID
+      WHERE s.createdAt > ?
+      ORDER BY s.createdAt ASC, v.ID ASC
+      LIMIT ? OFFSET ?
+    `;
+
+    mysqlConn.query(query, [lastSyncForMySQL, limit, offset], (err, rows) => {
+      if (err) return reject(err);
+      resolve(rows || []);
+    });
+  });
+}
+
+export async function syncSQVlanSmsRowsByBatch({
   mysqlConn,
   lastSyncForMySQL,
   onBatch,
-  batchSize = cfg.SQ_VLAN_SMS_BATCH_SIZE,
+  totalRecords,
 }) {
-  const query = buildVlanSmsSyncQuery();
+  // Calculate dynamic batch size: 1/10th of total records, minimum 100
+  const optimalBatchSize = Math.max(100, Math.ceil(totalRecords / 10));
 
   let fetchedCount = 0;
   let batchNumber = 0;
-  let batch = [];
+  let offset = 0;
 
-  logger.info("SQ MySQL streaming started", {
+  logger.info("SQ MySQL batch sync started", {
     lastSyncForMySQL,
-    batchSize,
+    totalRecords,
+    optimalBatchSize,
   });
 
-  const stream = mysqlConn
-    .query(query, [lastSyncForMySQL])
-    .stream({
-      highWaterMark: batchSize,
-    });
-
   try {
-    for await (const row of stream) {
-      fetchedCount += 1;
+    while (offset < totalRecords) {
+      const rows = await fetchVlanSmsBatch({
+        mysqlConn,
+        lastSyncForMySQL,
+        offset,
+        limit: optimalBatchSize,
+      });
 
-      const mapped = mapVlanSmsRow(row);
+      if (rows.length === 0) break;
 
-      if (!mapped.id) {
-        logger.warn("SQ row skipped because id is missing", { row });
-        continue;
-      }
+      const batch = rows
+        .map(mapVlanSmsRow)
+        .filter((mapped) => {
+          if (!mapped.id) {
+            logger.warn("SQ row skipped because id is missing", { mapped });
+            return false;
+          }
+          return true;
+        });
 
-      batch.push(mapped);
-
-      if (batch.length >= batchSize) {
-        batchNumber += 1;
-
-        await onBatch(batch, batchNumber, fetchedCount);
-
-        batch = [];
-      }
-    }
-
-    if (batch.length > 0) {
+      fetchedCount += rows.length;
       batchNumber += 1;
 
-      await onBatch(batch, batchNumber, fetchedCount);
+      if (batch.length > 0) {
+        await onBatch(batch, batchNumber, fetchedCount);
+      }
+
+      offset += optimalBatchSize;
     }
 
-    logger.info("SQ MySQL streaming completed", {
+    logger.info("SQ MySQL batch sync completed", {
       fetchedCount,
       batchNumber,
+      totalRecords,
     });
 
     return {
@@ -97,7 +129,7 @@ export async function streamSQVlanSmsRows({
       batchNumber,
     };
   } catch (err) {
-    logger.error("SQ MySQL streaming failed", {
+    logger.error("SQ MySQL batch sync failed", {
       error: err.message,
       stack: err.stack,
       fetchedCount,
