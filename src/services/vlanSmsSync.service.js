@@ -14,7 +14,8 @@ import {
 import { checkSQSchemaDrift } from "../SQHelper/vlanSmsSync.schemaDrift.js";
 import {
   formatDateForMySQL,
-  streamSQVlanSmsRows,
+  getVlanSmsRecordCount,
+  syncSQVlanSmsRowsByBatch,
 } from "../SQHelper/vlanSmsSync.helper.js";
 
 let isRunning = false;
@@ -37,7 +38,6 @@ function logSyncSummary(status, summary, error = null) {
   log(`Inserted         : ${summary.inserted}`);
   log(`Skipped          : ${summary.skipped}`);
   log(`Batches          : ${summary.batches}`);
-  log(`Batch Size       : ${summary.batchSize}`);
   log(`Last Sync        : ${summary.lastSync}`);
   log(`Duration Seconds : ${summary.durationSeconds}`);
 
@@ -117,7 +117,6 @@ export async function runVlanSmsSync() {
     inserted: 0,
     skipped: 0,
     batches: 0,
-    batchSize: cfg.SQ_VLAN_SMS_BATCH_SIZE,
     lastSync: null,
     durationSeconds: 0,
     schemaDrift: null,
@@ -125,7 +124,6 @@ export async function runVlanSmsSync() {
 
   try {
     logger.info("SQ VLAN SMS sync started", {
-      batchSize: cfg.SQ_VLAN_SMS_BATCH_SIZE,
       startDate: cfg.SQ_VLAN_SMS_START_DATE,
     });
 
@@ -147,10 +145,31 @@ export async function runVlanSmsSync() {
       lastSyncForMySQL,
     });
 
-    const streamResult = await streamSQVlanSmsRows({
+    // Get total record count
+    const totalRecords = await getVlanSmsRecordCount({
       mysqlConn,
       lastSyncForMySQL,
-      batchSize: cfg.SQ_VLAN_SMS_BATCH_SIZE,
+    });
+
+    logger.info("SQ total records fetched", {
+      totalRecords,
+      lastSyncForMySQL,
+    });
+
+    if (totalRecords === 0) {
+      logger.info("SQ no records to sync");
+      summary.fetched = 0;
+      summary.batches = 0;
+      summary.durationSeconds = Number(((Date.now() - startedAt) / 1000).toFixed(2));
+
+      logSyncSummary("SUCCESS", summary);
+      return summary;
+    }
+
+    const syncResult = await syncSQVlanSmsRowsByBatch({
+      mysqlConn,
+      lastSyncForMySQL,
+      totalRecords,
       onBatch: async (batch, batchNumber, fetchedSoFar) => {
         const insertedInBatch = await insertBatchTransactionally(batch, batchNumber);
 
@@ -169,8 +188,8 @@ export async function runVlanSmsSync() {
       },
     });
 
-    summary.fetched = streamResult.fetchedCount;
-    summary.batches = streamResult.batchNumber;
+    summary.fetched = syncResult.fetchedCount;
+    summary.batches = syncResult.batchNumber;
     summary.skipped = summary.fetched - summary.inserted;
     summary.durationSeconds = Number(((Date.now() - startedAt) / 1000).toFixed(2));
     
