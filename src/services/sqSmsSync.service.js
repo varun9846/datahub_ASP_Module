@@ -37,21 +37,9 @@ function logSyncSummary(status, summary, error = null) {
   log(`Batch Size       : ${summary.batchSize}`);
   log(`Last Sync        : ${summary.lastSync}`);
   log(`Duration Seconds : ${summary.durationSeconds}`);
-  log(`Schema Checked   : ${summary.schemaDrift?.checked ?? false}`);
-  log(
-    `New Columns      : ${
-      summary.schemaDrift?.newColumns?.length
-        ? summary.schemaDrift.newColumns.join(", ")
-        : "None"
-    }`
-  );
-  log(
-    `Missing PG Cols   : ${
-      summary.schemaDrift?.missingPgColumns?.length
-        ? summary.schemaDrift.missingPgColumns.join(", ")
-        : "None"
-    }`
-  );
+  // log(`Schema Checked   : ${summary.schemaDrift?.checked ?? false}`);
+  // log(`New Columns      : ${summary.schemaDrift?.newColumns?.length? summary.schemaDrift.newColumns.join(", "): "None"}`);
+  // log(`Missing PG Cols   : ${summary.schemaDrift?.missingPgColumns?.length? summary.schemaDrift.missingPgColumns.join(", "): "None"}`);
 
   if (error) {
     log(`Error Message    : ${error.message}`);
@@ -130,7 +118,7 @@ export async function runSQSmsSync() {
     await testSQMysqlConnection(mysqlConn);
     await ensureSmsDataTable(pool);
 
-    summary.schemaDrift = await checkSQSmsSchemaDrift(mysqlConn, pool);
+    // summary.schemaDrift = await checkSQSmsSchemaDrift(mysqlConn, pool);
 
     const dbLastSync = await getLastSmsDataSync(pool);
     const lastSyncSource = dbLastSync ?? getStartDateFallback();
