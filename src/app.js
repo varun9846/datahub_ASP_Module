@@ -3,6 +3,8 @@ import cors from "cors";
 import helmet from "helmet";
 import logger from "./logger.js";
 import sessionRoutes from "./routes/sessions.route.js"
+import sqSmsSyncRoutes from "./routes/sqSmsSync.route.js";
+
 import { cfg } from "./config.js";
 
 const app = express()
@@ -64,7 +66,7 @@ app.use((req, res, next) => {
 
 
 app.use("/api/sessions", sessionRoutes)
-
+app.use("/api/sq-sms-sync", sqSmsSyncRoutes);
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ error: 'Not Found' });
